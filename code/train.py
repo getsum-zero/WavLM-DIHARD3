@@ -11,44 +11,43 @@ from torch.utils.data import DataLoader
 from osdc.utils import BinaryMeter, MultiMeter
 from online_data import OnlineFeats
 
-parser = argparse.ArgumentParser(description="OSDC on AMI")
-parser.add_argument("--conf_file", type=str, default="../conf/train.yml")
-parser.add_argument("--log_dir", type=str, default="../exp/tcn")
+parser = argparse.ArgumentParser(description="OSDC on DIHARD3")
+parser.add_argument("--conf_file", type=str, default="conf/fine_tune.yml")
+parser.add_argument("--log_dir", type=str, default="exp/wavlm")
 parser.add_argument("--gpus", type=str, default="0")
 
 
 class PlainModel(nn.Module):
 
-    def __init__(self, masker):
+    def __init__(self, masker, ckpt = None):
 
         super(PlainModel, self).__init__()
         self.model = masker
+        if ckpt is not None:
+            self.model.load_state_dict(ckpt["model"])
+        self.normalize = ckpt["cfg"]["normalize"]
 
     def forward(self, tf_rep):
-
-        mask = self.model(tf_rep)
-
+        if self.normalize:
+            tf_rep = torch.nn.functional.layer_norm(tf_rep , tf_rep.shape)
+        
+        mask, _ = self.model.extract_features(tf_rep)
         return mask
 
 
-class OSDC_AMI(pl.LightningModule):
+class OSDC_DIHARD3(pl.LightningModule):
 
-    '''
-    Plain cycle routine we have 2 discriminators and two generators
-    '''
 
     def __init__(self, hparams):
-        super(OSDC_AMI, self).__init__()
+        super(OSDC_DIHARD3, self).__init__()
         self.configs = hparams # avoid pytorch-lightning hparams logging
 
-        if not self.configs["augmentation"]["probs"]:
-            # these are determined by looking at tensoboard statistics: used to fight imbalancing
-            cross = nn.CrossEntropyLoss(torch.Tensor([1.74, 1.0, 11.98, 219, 1000]).cuda(), reduction="none")
-        else:
-            cross = nn.CrossEntropyLoss(torch.Tensor([1.0, 2.13, 6.89, 20, 115]).cuda(), reduction="none")
+        # 样本不平衡：输入每一类的权重
+        # ====== ===========================
+        cross = nn.CrossEntropyLoss((1/torch.Tensor(self.configs["augmentation"]["probs"])).cuda(), reduction="none")
 
 
-        self.loss = lambda x, y : cross(x, y) #+ 0.1*dice(1-x, 1-y) # flip positive for focal loss
+        self.loss = lambda x, y : cross(x, y)  #+ 0.1*dice(1-x, 1-y) # flip positive for focal loss
         self.train_count_metrics = MultiMeter()
         self.train_vad_metrics = BinaryMeter()
         self.train_osd_metrics = BinaryMeter()
@@ -56,8 +55,10 @@ class OSDC_AMI(pl.LightningModule):
         self.val_vad_metrics = BinaryMeter()
         self.val_osd_metrics = BinaryMeter()
 
-        from osdc.models.tcn import TCN
-        self.model = PlainModel(TCN(80, 5, 1, 5, 3, 64, 128))
+        from osdc.models.WavLM import WavLM, WavLMConfig
+        checkpoint = torch.load(confs["training"]["resume_from"])
+        cfg = WavLMConfig(checkpoint['cfg'])
+        self.model = PlainModel(WavLM(cfg), checkpoint)
 
 
 
@@ -74,7 +75,6 @@ class OSDC_AMI(pl.LightningModule):
         preds = torch.softmax(preds, 1)
         self.train_count_metrics.update(torch.argmax(preds, 1), label)
         self.train_vad_metrics.update(torch.sum(preds[:, 1:], 1), label >= 1)
-        #self.train_osd_metrics.update(torch.argmax(torch.cat((preds[:, :2], torch.sum(preds[:, 2:], 1, keepdim=True)),1), 1), torch.clamp(label, 0, 2))
         self.train_osd_metrics.update(torch.sum(preds[:, 2:], 1), label >= 2)
 
 
@@ -108,66 +108,69 @@ class OSDC_AMI(pl.LightningModule):
             })
         return output
 
-    def validation_step(self, batch, batch_indx):
+    '''
+    # def validation_step(self, batch, batch_indx):
 
-        feats, label, _ = batch
-        preds = self.model(feats)
-        loss = self.loss(preds, label).mean()
-        preds = torch.softmax(preds, 1)
-        self.val_count_metrics.update(torch.argmax(preds, 1), label)
-        self.val_vad_metrics.update(torch.sum(preds[:, 1:], 1), label >= 1)
-        #self.val_osd_metrics.update(torch.argmax(torch.cat((preds[:, :2], torch.sum(preds[:, 2:], 1, keepdim=True)),1),1), torch.clamp(label, 0, 2))
-        self.val_osd_metrics.update(torch.sum(preds[:, 2:], 1), label >= 2)
-        tqdm_dict = {'val_loss': loss}
+    #     feats, label, _ = batch
+    #     preds = self.model(feats)
+    #     loss = self.loss(preds, label).mean()
+    #     preds = torch.softmax(preds, 1)
+    #     self.val_count_metrics.update(torch.argmax(preds, 1), label)
+    #     self.val_vad_metrics.update(torch.sum(preds[:, 1:], 1), label >= 1)
+    #     #self.val_osd_metrics.update(torch.argmax(torch.cat((preds[:, :2], torch.sum(preds[:, 2:], 1, keepdim=True)),1),1), torch.clamp(label, 0, 2))
+    #     self.val_osd_metrics.update(torch.sum(preds[:, 2:], 1), label >= 2)
+    #     tqdm_dict = {'val_loss': loss}
 
-        output = OrderedDict({
-            'val_loss': loss,
-            'progress_bar': tqdm_dict,
-        })
+    #     output = OrderedDict({
+    #         'val_loss': loss,
+    #         'progress_bar': tqdm_dict,
+    #     })
 
-        return output
+    #     return output
 
-    def validation_step_end(self, outputs):
+    # def validation_step_end(self, outputs):
 
-        avg_loss = outputs["val_loss"].mean()
-        tqdm_dict = {'val_loss': avg_loss}
-        tensorboard_logs = {'val_loss': avg_loss,
-                            'val_tp_count': self.val_count_metrics.get_tp(),
-                            'val_tn_count': self.val_count_metrics.get_tn(),
-                            'val_fp_count': self.val_count_metrics.get_fp(),
-                            'val_fn_count': self.val_count_metrics.get_fn(),
-                            'val_prec_count': self.val_count_metrics.get_precision(),
-                            'val_rec_count': self.val_count_metrics.get_recall(),
-                            'val_prec_vad': self.val_vad_metrics.get_precision(),
-                            'val_rec_vad': self.val_vad_metrics.get_recall(),
-                            'val_fa_vad': self.val_vad_metrics.get_fa(),
-                            'val_miss_vad': self.val_vad_metrics.get_miss(),
-                            'val_der_vad': self.val_vad_metrics.get_der(),
-                            'val_prec_osd': self.val_osd_metrics.get_precision(),
-                            'val_rec_osd': self.val_osd_metrics.get_recall(),
-                            'val_fa_osd': self.val_osd_metrics.get_fa(),
-                            'val_miss_osd': self.val_osd_metrics.get_miss(),
-                            'val_der_osd': self.val_osd_metrics.get_der(),
-                            }
+    #     avg_loss = outputs["val_loss"].mean()
+    #     tqdm_dict = {'val_loss': avg_loss}
+    #     tensorboard_logs = {'val_loss': avg_loss,
+    #                         'val_tp_count': self.val_count_metrics.get_tp(),
+    #                         'val_tn_count': self.val_count_metrics.get_tn(),
+    #                         'val_fp_count': self.val_count_metrics.get_fp(),
+    #                         'val_fn_count': self.val_count_metrics.get_fn(),
+    #                         'val_prec_count': self.val_count_metrics.get_precision(),
+    #                         'val_rec_count': self.val_count_metrics.get_recall(),
+    #                         'val_prec_vad': self.val_vad_metrics.get_precision(),
+    #                         'val_rec_vad': self.val_vad_metrics.get_recall(),
+    #                         'val_fa_vad': self.val_vad_metrics.get_fa(),
+    #                         'val_miss_vad': self.val_vad_metrics.get_miss(),
+    #                         'val_der_vad': self.val_vad_metrics.get_der(),
+    #                         'val_prec_osd': self.val_osd_metrics.get_precision(),
+    #                         'val_rec_osd': self.val_osd_metrics.get_recall(),
+    #                         'val_fa_osd': self.val_osd_metrics.get_fa(),
+    #                         'val_miss_osd': self.val_osd_metrics.get_miss(),
+    #                         'val_der_osd': self.val_osd_metrics.get_der(),
+    #                         }
 
-        self.train_count_metrics.reset()
-        self.train_vad_metrics.reset()
-        self.train_osd_metrics.reset()
-        self.val_count_metrics.reset()
-        self.val_vad_metrics.reset()
-        self.val_osd_metrics.reset()
-        output = OrderedDict({
-            'val_loss': avg_loss,
-            'progress_bar': tqdm_dict,
-            'log': tensorboard_logs
-        })
+    #     self.train_count_metrics.reset()
+    #     self.train_vad_metrics.reset()
+    #     self.train_osd_metrics.reset()
+    #     self.val_count_metrics.reset()
+    #     self.val_vad_metrics.reset()
+    #     self.val_osd_metrics.reset()
+    #     output = OrderedDict({
+    #         'val_loss': avg_loss,
+    #         'progress_bar': tqdm_dict,
+    #         'log': tensorboard_logs
+    #     })
 
-        return output
+    #     return output
+    '''
 
     def configure_optimizers(self):
 
         opt = torch.optim.Adam(self.model.parameters(),
                                     self.configs["opt"]["lr"], weight_decay=self.configs["opt"]["weight_decay"])
+        # ReduceLROnPlateau 当性能不再增加时，减小学习率
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt)
 
         return {
@@ -178,21 +181,22 @@ class OSDC_AMI(pl.LightningModule):
 
 
     def train_dataloader(self):
-        dataset = OnlineFeats(self.configs["data"]["chime6_root"], self.configs["data"]["label_train"],
+        dataset = OnlineFeats(self.configs["data"]["data_root_train"], self.configs["data"]["label_train"],
                               self.configs, probs=self.configs["augmentation"]["probs"], segment=self.configs["data"]["segment"])
+        
         dataloader = DataLoader(dataset, batch_size=self.configs["training"]["batch_size"],
                                 shuffle=True, num_workers=self.configs["training"]["num_workers"], drop_last=True)
         return dataloader
 
 
-    def val_dataloader(self):
+    # def val_dataloader(self):
 
-        dataset = OnlineFeats(self.configs["data"]["chime6_root"], self.configs["data"]["label_val"],
-                                    self.configs, segment=self.configs["data"]["segment"])
-        dataloader = DataLoader(dataset, batch_size=self.configs["training"]["batch_size"],
-                                shuffle=True, num_workers=self.configs["training"]["num_workers"], drop_last=True)
+    #     dataset = OnlineFeats(self.configs["data"]["data_root_val"], self.configs["data"]["label_val"],
+    #                                 self.configs, segment=self.configs["data"]["segment"])
+    #     dataloader = DataLoader(dataset, batch_size=self.configs["training"]["batch_size"],
+    #                             shuffle=True, num_workers=self.configs["training"]["num_workers"], drop_last=True)
 
-        return dataloader
+    #     return dataloader
 
 if __name__ == "__main__":
 
@@ -202,12 +206,13 @@ if __name__ == "__main__":
 
     # test if compatible with lightning
     confs.update(args.__dict__)
-    a = OSDC_AMI(confs)
+    net = OSDC_DIHARD3(confs)
 
     checkpoint_dir = os.path.join(confs["log_dir"], 'checkpoints/')
     checkpoint = ModelCheckpoint(checkpoint_dir, monitor='val_loss',
                                  mode='min',  verbose=True, save_top_k=5)
 
+    # 当到达性能不在改变时，停止训练
     early_stop_callback = EarlyStopping(
         monitor='val_loss',
         patience=20,
@@ -215,18 +220,19 @@ if __name__ == "__main__":
         mode='min'
     )
 
+    # 存储配置文件
     with open(os.path.join(confs["log_dir"], "confs.yml"), "w") as f:
         yaml.dump(confs, f)
 
+    # 以log_dir目录名存储log
     logger = TensorBoardLogger(os.path.dirname(confs["log_dir"]), confs["log_dir"].split("/")[-1])
 
-    trainer = pl.Trainer(max_epochs=confs["training"]["n_epochs"], gpus=confs["gpus"],
+    trainer = pl.Trainer(max_epochs=confs["training"]["n_epochs"], # gpus=confs["gpus"],
                          accumulate_grad_batches=confs["training"]["accumulate_batches"], callbacks=[checkpoint, early_stop_callback],
                          logger = logger,
                          gradient_clip_val=confs["training"]["gradient_clip"],
                          accelerator = "gpu" if torch.cuda.is_available() else "cpu",
-                         strategy = "dp",
+                         strategy = "auto",
                          devices = "auto",
-                         # resume_from_checkpoint=confs["traning"]["resume_from"]
-                         )
-    trainer.fit(a)
+                    )
+    trainer.fit(net)

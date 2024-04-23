@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "../.."
+		},
+		{
+			"path": "../../../../data/AMI"
+		},
+		{
+			"path": "../../../../data/DIHARD3"
+		}
+	],
+	"settings": {}
+}

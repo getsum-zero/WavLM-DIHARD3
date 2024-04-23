@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import LayerNorm
-from modules import (
+from osdc.models.modules import (
     Fp32GroupNorm,
     Fp32LayerNorm,
     GradMultiply,
@@ -236,6 +236,7 @@ class WavLM(nn.Module):
             conv_bias=cfg.conv_bias,
         )
 
+        # change the dim(after conv) to cfg.encoder_embed_dim
         self.post_extract_proj = (
             nn.Linear(self.embed, cfg.encoder_embed_dim)
             if self.embed != cfg.encoder_embed_dim
@@ -337,6 +338,8 @@ class WavLM(nn.Module):
         else:
             with torch.no_grad():
                 features = self.feature_extractor(source)
+        
+        print("Cov", features.shape)
 
         features = features.transpose(1, 2)
         features = self.layer_norm(features)
@@ -366,7 +369,6 @@ class WavLM(nn.Module):
             padding_mask=padding_mask,
             layer=None if output_layer is None else output_layer - 1
         )
-
         res = {"x": x, "padding_mask": padding_mask, "features": features, "layer_results": layer_results}
 
         feature = res["features"] if ret_conv else res["x"]
@@ -743,25 +745,41 @@ class TransformerSentenceEncoderLayer(nn.Module):
 
 
 
+# [batch, seq_len] -> [batch, 1, seq_len]
+# ============ [(512,10,5), (512,3,2), (512,3,2), (512,3,2), (512,3,2), (512,2,2), (512,2,2)] ===============
+#  by conv1d
+# N_new = \floor{ (N - K + 2P) / S + 1 } 
+# [batch, 1, seq_len] -> [batch, 512, N] 
+# \floor { seq_len / 320 - 0.25 } >= 1  ===>  N >= 400
+# eq    k = 25ms     s = 20ms
+
+
+import yaml
 if __name__ == "__main__":
 
     # load the pre-trained checkpoints
-    checkpoint = torch.load('../../../exp/wavlm/checkpoint/WavLM-Large.pt')
+    checkpoint = torch.load('exp/wavlm/checkpoint/WavLM-Large.pt')
     cfg = WavLMConfig(checkpoint['cfg'])
+    with open("conf/WavLM.yml", 'w') as file:
+        file.write(yaml.dump(cfg.__dict__, allow_unicode=True))
+    print(cfg.__dict__)
     model = WavLM(cfg)
     model.load_state_dict(checkpoint['model'])
+    # print(model)
     model.eval()
 
     # extract the representation of last layer
-    wav_input_16khz = torch.randn(1,10000)
+    wav_input_16khz = torch.randn(5,160400)
     if cfg.normalize:
         wav_input_16khz = torch.nn.functional.layer_norm(wav_input_16khz , wav_input_16khz.shape)
-    rep = model.extract_features(wav_input_16khz)[0]
+    rep, out = model.extract_features(wav_input_16khz)
+    print(rep.shape, out)
 
     # extract the representation of each layer
-    wav_input_16khz = torch.randn(1,10000)
-    if cfg.normalize:
-        wav_input_16khz = torch.nn.functional.layer_norm(wav_input_16khz , wav_input_16khz.shape)
-    rep, layer_results = model.extract_features(wav_input_16khz, output_layer=model.cfg.encoder_layers, ret_layer_results=True)[0]
-    layer_reps = [x.transpose(0, 1) for x, _ in layer_results]
-    print(layer_reps)
+    # wav_input_16khz = torch.randn(32,1000)
+    # if cfg.normalize:
+    #     wav_input_16khz = torch.nn.functional.layer_norm(wav_input_16khz , wav_input_16khz.shape)
+    # rep, layer_results = model.extract_features(wav_input_16khz, output_layer=model.cfg.encoder_layers, ret_layer_results=True)[0]
+    # layer_reps = [x.transpose(0, 1).detach().numpy() for x, _ in layer_results]
+    # for i in layer_reps:
+    #     print(i.shape)

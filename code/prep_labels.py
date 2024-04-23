@@ -94,20 +94,24 @@ if __name__ == "__main__":
         if sess not in devices.keys():
             print("Skipping SESSION !!")
             continue
+
         min_len = min([len(sf.read(x)[0]) for x in devices[sess]])
-        dummy = np.zeros(int(np.ceil(min_len/(configs["feats"]["hop_size"]*fs))))
+
+        hop_size = configs["feats"]["hop_size"]*fs
+        frame_size = configs["feats"]["frame_size"]*fs
+        dummy = np.zeros(int(np.ceil((min_len - frame_size)/hop_size)))
 
         for spk in diarization[sess].keys():
             if spk == "garbage":
                 continue
             else:
                 for s, e in diarization[sess][spk]:
-                    s = int(np.floor(s / (configs["feats"]["hop_size"]*fs)))
-                    e = int(np.floor(e / (configs["feats"]["hop_size"]*fs)))
+                    s = int(np.floor((s - frame_size) / hop_size + 1))
+                    e = int(np.floor((e - frame_size) / hop_size + 1))
                     dummy[s:e] += 1
         #assert not np.where(dummy > 4)[0].any()
         dummy = np.clip(dummy, 0, 2)
-        print(dummy)
+        #print(np.max(dummy))
         sf.write(os.path.join(args.out_folder, "LABEL-{}.wav".format(sess)), dummy, fs, subtype="FLOAT")
 
 
